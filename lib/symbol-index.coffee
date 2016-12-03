@@ -7,6 +7,7 @@ generate = require './symbol-generator'
 patterns = require './symbol-pattern-definitions'
 utils = require './symbol-utils'
 {CompositeDisposable} = require 'atom'
+{Task} = require 'atom'
 
 module.exports =
 class SymbolIndex
@@ -114,16 +115,23 @@ class SymbolIndex
           @processFile(fqn)
 
   rebuild: ->
-    for root in @roots
-      @processDirectory(root.path)
-    @rescanDirectories = false
-    console.log('No Grammar:', Object.keys(@skipGrammars)) if @logToConsole
+    # Trying to move indexing to a background task, but most of the work
+    # cannot be done there (at least as currently written) because the Atom
+    # APIs are not available. This approach prevents the UI from freezing,
+    # but performance is still noticeably impacted by the indexing.
+
+    task = Task.once  require.resolve('./index-task'), @roots, ->
+      @rescanDirectories = false
+
+    task.on 'processFile', (filePath) =>
+      @processFile(filePath)
 
   gotoDeclaration: ->
     editor = atom.workspace.getActiveTextEditor()
     # Make a word selection based on current cursor
     editor?.selectWordsContainingCursors()
     word = editor?.getSelectedText()
+
     if not word?.length
       return null
 
@@ -185,36 +193,42 @@ class SymbolIndex
       @processDirectory(dir)
 
   processFile: (fqn) ->
-    console.log('GOTO: file', fqn) if @logToConsole
-    text = fs.readFileSync(fqn, { encoding: 'utf8' })
-    grammar = atom.grammars.selectGrammar(fqn, text)
-    fileType = @getFileTypeKey(fqn)
-    isSkipGrammar = @skipGrammars[fileType]
-    if not grammar
-      return
+    try
+      console.log('GOTO: file', fqn) if @logToConsole
+      text = fs.readFileSync(fqn, { encoding: 'utf8' })
+      grammar = atom.grammars.selectGrammar(fqn, text)
+      fileType = @getFileTypeKey(fqn)
+      isSkipGrammar = @skipGrammars[fileType]
 
-    #debugger
-    if not isSkipGrammar
-      if isSkipGrammar is undefined
-        # Is it a null grammar or there are no patterns that could match
-        if grammar.scopeName is 'text.plain.null-grammar' or not grammar.rawPatterns
-          isSkipGrammar = true
-        else
-          # Check rawPatterns and rawPatterns.captures for any match
-          isPatternMatch = grammar.rawPatterns.some((pattern) ->
-            isMatch = patterns.symbol.test(pattern.name)
-            if not isMatch and pattern.captures
-              # Check captures, which is an optional object (not an array)
-              for i, capture of pattern.captures
-                if isMatch = patterns.symbol.test(capture.name)
-                  break
-            isMatch
-          )
-          isSkipGrammar = not isPatternMatch
-      if isSkipGrammar is false
-        @entries[fqn] = generate(fqn, grammar, text)
+      if not grammar
+        return
 
-    @skipGrammars[fileType] = isSkipGrammar
+      #debugger
+      if not isSkipGrammar
+        if isSkipGrammar is undefined
+          # Is it a null grammar or there are no patterns that could match
+          if grammar.scopeName is 'text.plain.null-grammar' or not grammar.rawPatterns
+            isSkipGrammar = true
+          if grammar.scopeName is 'text.html.php'
+            isSkipGrammar = false
+          else
+            # Check rawPatterns and rawPatterns.captures for any match
+            isPatternMatch = grammar.rawPatterns.some((pattern) ->
+              isMatch = patterns.symbol.test(pattern.name)
+              if not isMatch and pattern.captures
+                # Check captures, which is an optional object (not an array)
+                for i, capture of pattern.captures
+                  if isMatch = patterns.symbol.test(capture.name)
+                    break
+              isMatch
+            )
+            isSkipGrammar = not isPatternMatch
+        if isSkipGrammar is false
+          @entries[fqn] = generate(fqn, grammar, text)
+
+      @skipGrammars[fileType] = isSkipGrammar
+    catch e
+      console.log(e) if @logToConsole
 
   keepPath: (filePath, isFile = true) ->
     # Should we keep this path in @entries?  It is not kept if it is excluded by the
